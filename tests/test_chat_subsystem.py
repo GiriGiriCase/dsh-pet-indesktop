@@ -75,7 +75,8 @@ def test_prompt_priority_and_limits(tmp_path: Path):
     ]
     builder = PromptBuilder(tmp_path / "assets" / "characters")
     messages = builder.build_messages(settings, "cat", history, "question", role_prompt="override")
-    assert messages[0] == {"role": "system", "content": "override"}
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"].startswith("override\n\n【时间信息】")
     assert messages[-1] == {"role": "user", "content": "question"}
     assert len(messages) <= 4
 
