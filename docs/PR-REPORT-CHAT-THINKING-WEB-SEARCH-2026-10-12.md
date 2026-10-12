@@ -130,3 +130,11 @@
 - 配置：新增 `chat.web_search` 与 provider 下 `thinking` / `reasoning_effort`；缺键全部回落默认，回滚后旧版本忽略这些键。
 - 会话文件：可能出现 `reasoning` / `activity` 两个新键，旧版本读取时忽略。
 - 回滚 = `git revert`；已写入的上述键无害残留。
+
+## 九、第二轮：rebase 到 `dca44a7`（2026-10-13）
+
+上游合并 #243（release/2026-10-08-candidate，基线 `ee699c7` 之后 168 个提交）后，本分支 rebase 到 `dca44a7`。
+
+- 冲突：`pet/quick_chat.py`：上游新增 `_request_presentation_valid()`（请求发出时的宠物窗口已失效则不再更新气泡），与本 PR 的 `_activity` 相邻。两者都保留，并让 `_activity` 同样遵守该检查，与上游 `_delta` 口径一致。`docs/INDEX.md` 登记行按并集合并。
+- 重叠检查：`git grep` 新基线，上游没有同类实现（`reasoning_content` 只在 `pet/vision.py` 的看屏响应里读取；无 `setMarkdown`；无对话时间注入）。
+- 第一节到第八节的数字基于 `ee699c7` 测得，未在新基线上重测（实现未变，只是位置变了）；新基线上的测试结果见 PR 描述「第二轮」。
