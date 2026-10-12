@@ -1911,6 +1911,18 @@ class ModernSettingsDialog(QDialog):
                             "connection_test",
                         ),
                     ),
+                    (
+                        "深度思考与联网",
+                        claim(
+                            "thinking_mode",
+                            "reasoning_effort",
+                            "web_search_enabled",
+                            "web_search_engine",
+                            "web_search_key",
+                            "web_search_max_results",
+                            "web_search_fetch_pages",
+                        ),
+                    ),
                     ("系统通知", claim("system_notifications_enabled")),
                     (
                         "视觉能力",

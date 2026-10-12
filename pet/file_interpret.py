@@ -245,6 +245,8 @@ class FileInterpretController(QObject):
 
         settings = self._win.cfg.chat_settings()
         provider = copy.copy(settings.active_config)
+        # 文件内容已随消息给出，不走联网检索（省一次检索请求和等待）
+        provider.web_search = None
         provider.api_key = self._win.cfg.resolve_api_key(provider)
         if not str(provider.api_key or "").strip():
             self._state = "idle"

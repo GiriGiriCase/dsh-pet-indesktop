@@ -1,6 +1,8 @@
 from __future__ import annotations
 import json, ssl, threading, urllib.error, urllib.request
 from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from .models import ProviderConfig
 
@@ -83,8 +85,8 @@ class ProviderError(RuntimeError):
     def __init__(self,message,status=None): self.status=status; super().__init__(f'HTTP {status}: {message}' if status else message)
 
 class SSEParser:
-    def __init__(self): self._buffer=b''; self.done=False
-    def feed(self,chunk:bytes):
+    def __init__(self): self._buffer=b''; self.done=False; self.finish_reason=None
+    def feed_events(self,chunk:bytes):
         self._buffer+=chunk
         if len(self._buffer)>1024*1024: raise ProviderError('SSE 缓冲超过 1MB 上限（服务端未按事件分隔）')  # 审查 GLM-M5：防异常 provider 无界堆积
         out=[]
@@ -106,39 +108,219 @@ class SSEParser:
             if isinstance(payload,dict) and payload.get('error'):
                 err=payload['error']; msg=err.get('message','Provider 返回错误') if isinstance(err,dict) else str(err); raise ProviderError(str(msg))
             choices=payload.get('choices',[]) if isinstance(payload,dict) else []
-            if choices:
-                delta=choices[0].get('delta',{}) or {}; content=delta.get('content') if isinstance(delta,dict) else None
-                if content: out.append(str(content))
+            if choices and isinstance(choices[0],dict):
+                delta=choices[0].get('delta',{}) or {}
+                if not isinstance(delta,dict): delta={}
+                # reasoning_content：DeepSeek/智谱等思考模型的思维链；reasoning：OpenRouter 等网关的同义字段
+                reasoning=delta.get('reasoning_content') or delta.get('reasoning')
+                event={'content':str(delta.get('content') or ''),'reasoning':reasoning if isinstance(reasoning,str) else '','finish_reason':choices[0].get('finish_reason')}
+                if event['finish_reason']: self.finish_reason=event['finish_reason']
+                if event['content'] or event['reasoning'] or event['finish_reason']: out.append(event)
         return out
+    def feed(self,chunk:bytes):
+        """兼容旧接口：只返回正文增量。"""
+        return [e['content'] for e in self.feed_events(chunk) if e['content']]
+
+@dataclass(frozen=True)
+class StreamEvent:
+    """流中的非正文事件：kind='reasoning' 思考过程增量；kind='status' 联网等进度提示。
+    正文增量仍以 str 产出，旧调用方（只拼接 str）不受影响。"""
+    kind: str
+    text: str
+
+
+_WEEKDAYS='一二三四五六日'
+
+def _today_text():
+    now=datetime.now(); return f"{now:%Y-%m-%d} 星期{_WEEKDAYS[now.weekday()]} {now:%H:%M}"
+
+def _sends_thinking_param(config) -> bool:
+    """auto 模式下仅对 DeepSeek 官方地址发送 thinking 参数，避免严格校验参数的服务报错。"""
+    return getattr(config,'thinking','auto')!='auto' or 'deepseek.com' in str(config.base_url or '').lower()
+
+def thinking_payload(config, *, force_disable=False) -> dict[str,Any]:
+    """DeepSeek V4 格式：thinking={'type':enabled/disabled}，reasoning_effort=low/high/max。"""
+    mode=getattr(config,'thinking','auto')
+    if force_disable:
+        return {'thinking':{'type':'disabled'}} if _sends_thinking_param(config) else {}
+    if mode=='enabled':
+        return {'thinking':{'type':'enabled'},'reasoning_effort':getattr(config,'reasoning_effort','high') or 'high'}
+    if mode=='disabled':
+        return {'thinking':{'type':'disabled'}}
+    return {}
+
+_WEB_TOOLS=[
+    {'type':'function','function':{'name':'web_search','description':'用搜索引擎联网搜索，获取最新/实时信息。返回若干条标题、链接和摘要。','parameters':{'type':'object','properties':{'query':{'type':'string','description':'精炼的搜索关键词'}},'required':['query']}}},
+    {'type':'function','function':{'name':'fetch_url','description':'读取指定网页的正文内容，用于搜索摘要不够详细时深入阅读。','parameters':{'type':'object','properties':{'url':{'type':'string','description':'要读取的网页地址（http/https）'}},'required':['url']}}},
+]
+_PLANNER_PROMPT=("你是联网检索助手，当前时间：{today}。请判断：回答用户最后一条消息，是否需要联网获取最新、实时或你不确定的事实信息"
+    "（新闻、天气、价格、版本、赛事、政策、具体数据、某个人/产品/事件的现状等）。\n"
+    "- 需要：调用 web_search 搜索，关键词要精炼，必要时换角度多搜几次；摘要信息不足时，可调用 fetch_url 阅读最相关的网页。\n"
+    "- 不需要（闲聊、常识、写作、翻译、代码、情感陪伴等）：不要调用任何工具，直接回复「无需搜索」。\n"
+    "你只负责收集资料，不要直接回答用户的问题。")
+_CONTEXT_PROMPT=("【联网搜索结果】（当前时间：{today}；以下资料是刚刚联网获取的）\n\n{notes}\n\n"
+    "请结合以上资料回答用户最新的问题：优先采用资料中的最新信息；资料与你已有知识冲突时以资料为准；资料不足以回答时如实说明。"
+    "如果引用了资料，在回答末尾用「参考来源」简短列出对应链接。")
+_MAX_RESEARCH_ROUNDS=3
+_MAX_CALLS_PER_ROUND=4
+_MAX_NOTES_CHARS=24000
+
+def _text_of(content) -> str:
+    if isinstance(content,str): return content
+    if isinstance(content,list):
+        parts=[]
+        for item in content:
+            if isinstance(item,dict) and item.get('type')=='text': parts.append(str(item.get('text','')))
+            elif isinstance(item,dict) and item.get('type')=='image_url': parts.append('[图片]')
+        return '\n'.join(parts)
+    return str(content or '')
+
+def _recent_dialogue(messages, limit=6, max_chars=2000):
+    out=[]
+    for m in messages:
+        if not isinstance(m,dict) or m.get('role') not in ('user','assistant'): continue
+        text=_text_of(m.get('content')).strip()
+        if text: out.append({'role':m['role'],'content':text[-max_chars:]})
+    out=out[-limit:]
+    while out and out[0]['role']!='user': out.pop(0)
+    return out
+
+def inject_search_context(messages, notes: str):
+    """把检索资料并入首条 system 消息（无 system 时插到最前），不改动原列表。"""
+    block=_CONTEXT_PROMPT.format(today=_today_text(),notes=notes)
+    messages=[dict(m) if isinstance(m,dict) else m for m in messages]
+    if messages and isinstance(messages[0],dict) and messages[0].get('role')=='system' and isinstance(messages[0].get('content'),str):
+        messages[0]['content']=(messages[0]['content'].rstrip()+'\n\n'+block).strip()
+    else:
+        messages.insert(0,{'role':'system','content':block})
+    return messages
+
 
 class OpenAICompatibleProvider:
-    def stream(self,messages:list[dict[str,Any]],config:ProviderConfig,cancel_event:threading.Event,response_holder:list|None=None)->Iterator[str]:
+    def _open(self,payload,config,accept):
         endpoint=normalize_chat_endpoint(config.base_url,config.chat_path)
-        payload:dict[str,Any]={'model':config.model,'messages':messages,'stream':True,'temperature':config.temperature,'max_tokens':config.max_tokens}
-        headers=build_browser_headers({'Content-Type':'application/json','Accept':'text/event-stream'})
+        headers=build_browser_headers({'Content-Type':'application/json','Accept':accept})
         if config.api_key: headers['Authorization']=f'Bearer {config.api_key}'
         req=urllib.request.Request(endpoint,data=json.dumps(payload,ensure_ascii=False).encode('utf-8'),headers=headers,method='POST')
-        try: response=urllib.request.urlopen(req,timeout=config.timeout,context=_make_ssl_context(config.verify_ssl))
+        try: return urllib.request.urlopen(req,timeout=config.timeout,context=_make_ssl_context(config.verify_ssl))
         except urllib.error.HTTPError as exc:
             detail=exc.read(2048).decode('utf-8','replace'); raise ProviderError(_safe_error_detail(detail),exc.code) from exc
         except urllib.error.URLError as exc:
             reason=exc.reason; hint=_CERT_HINT if _is_cert_verify_error(reason) else ''
             raise ProviderError(f'网络连接失败：{reason}{hint}') from exc
         except OSError as exc: raise ProviderError(f'网络请求失败：{exc}') from exc
+
+    def stream(self,messages:list[dict[str,Any]],config:ProviderConfig,cancel_event:threading.Event,response_holder:list|None=None)->Iterator[str]:
+        web=getattr(config,'web_search',None)
+        if web is not None and getattr(web,'enabled',False) and not cancel_event.is_set():
+            notes=yield from self._research(messages,config,cancel_event,response_holder)
+            if cancel_event.is_set(): return
+            if notes:
+                messages=inject_search_context(messages,notes)
+                yield StreamEvent('status','已获取联网资料，正在组织回答…')
+        yield from self._stream_answer(messages,config,cancel_event,response_holder)
+
+    def _stream_answer(self,messages,config,cancel_event,response_holder):
+        payload:dict[str,Any]={'model':config.model,'messages':messages,'stream':True,'temperature':config.temperature,'max_tokens':config.max_tokens}
+        payload.update(thinking_payload(config))
+        response=self._open(payload,config,'text/event-stream')
         if response_holder is not None:
             response_holder.append(response)
-        parser=SSEParser()
+        parser=SSEParser(); got_content=False; got_reasoning=False
         try:
             while not cancel_event.is_set():
                 chunk=response.read(4096)
                 if not chunk: break
-                for delta in parser.feed(chunk):
+                for event in parser.feed_events(chunk):
                     if cancel_event.is_set(): return
-                    yield delta
+                    if event['reasoning']:
+                        got_reasoning=True; yield StreamEvent('reasoning',event['reasoning'])
+                    if event['content']:
+                        got_content=True; yield event['content']
                 if parser.done: break
         finally:
             try: response.close()
             except Exception: pass
+        if got_reasoning and not got_content and parser.finish_reason=='length' and not cancel_event.is_set():
+            raise ProviderError(f'深度思考用完了「最大输出 Token」（当前 {config.max_tokens}），还没来得及给出回答。请在 AI 设置 → 生成参数里调大（建议 8192 以上）。')
+
+    def _complete_json(self,payload,config,response_holder):
+        response=self._open(payload,config,'application/json')
+        if response_holder is not None: response_holder.append(response)
+        try: raw=response.read(4*1024*1024)
+        finally:
+            try: response.close()
+            except Exception: pass
+        try: data=json.loads(raw.decode('utf-8','replace'))
+        except ValueError as exc: raise ProviderError('Provider 返回了无效 JSON') from exc
+        if isinstance(data,dict) and data.get('error'):
+            err=data['error']; raise ProviderError(str(err.get('message','Provider 返回错误') if isinstance(err,dict) else err))
+        try: return data['choices'][0]['message'] or {}
+        except (KeyError,IndexError,TypeError) as exc: raise ProviderError('Provider 返回格式不符合 Chat Completions') from exc
+
+    def _run_tool(self,name,args,web,config,timeout):
+        """执行一次工具调用 → (给模型的结果文本, 是否成功, 状态提示列表)。"""
+        from . import web_search as ws_mod
+        if name=='web_search':
+            query=str(args.get('query','')).strip()
+            status=[f'🔍 正在搜索：{query}']
+            try:
+                results=ws_mod.search(query,web,timeout=timeout,verify_ssl=config.verify_ssl)
+            except ws_mod.WebSearchError as exc:
+                text=f'搜索「{query}」失败：{exc}'; return text,False,status+['　'+text]
+            return ws_mod.format_results(query,results),bool(results),status+[f'　找到 {len(results)} 条结果']
+        if name=='fetch_url':
+            url=str(args.get('url','')).strip()
+            status=[f'📄 正在阅读：{url}']
+            try:
+                text=ws_mod.fetch_page_text(url,timeout=timeout,verify_ssl=config.verify_ssl)
+            except ws_mod.WebSearchError as exc:
+                text=f'读取网页 {url} 失败：{exc}'; return text,False,status+['　'+text]
+            return f'网页 {url} 的内容：\n{text}',True,status
+        return f'未知工具：{name}',False,[]
+
+    def _research(self,messages,config,cancel_event,response_holder):
+        """检索阶段：非思考模式 + 工具调用，让模型决定搜什么；返回整理好的资料文本（不需要搜索时为空串）。
+
+        单独走一轮非思考请求，而不是在正式回答里挂 tools：DeepSeek 思考模式带 tools 时
+        要求回传历史所有轮次的 reasoning_content（缺失即 400），而会话历史并不保存思维链。"""
+        web=config.web_search
+        dialogue=_recent_dialogue(messages)
+        if not dialogue: return ''
+        tools=_WEB_TOOLS if getattr(web,'fetch_pages',True) else _WEB_TOOLS[:1]
+        planner=[{'role':'system','content':_PLANNER_PROMPT.format(today=_today_text())},*dialogue]
+        notes=[]; used=0; searched=False; net_timeout=max(5.0,min(float(config.timeout),20.0))
+        yield StreamEvent('status','正在判断是否需要联网…')
+        for round_no in range(_MAX_RESEARCH_ROUNDS):
+            if cancel_event.is_set(): return ''
+            payload={'model':config.model,'messages':planner,'tools':tools,'tool_choice':'auto','stream':False,'max_tokens':1024,'temperature':0.3}
+            payload.update(thinking_payload(config,force_disable=True))
+            try: msg=self._complete_json(payload,config,response_holder)
+            except ProviderError as exc:
+                if cancel_event.is_set(): return ''
+                if round_no==0:
+                    yield StreamEvent('status',f'联网检索不可用（{exc}），将直接回答')
+                    return ''
+                break
+            calls=[c for c in (msg.get('tool_calls') or []) if isinstance(c,dict) and isinstance(c.get('function'),dict)][:_MAX_CALLS_PER_ROUND]
+            if not calls: break
+            searched=True
+            assistant={'role':'assistant','content':msg.get('content') or '','tool_calls':calls}
+            if msg.get('reasoning_content'): assistant['reasoning_content']=msg['reasoning_content']
+            planner.append(assistant)
+            for call in calls:
+                if cancel_event.is_set(): return ''
+                fn=call['function']
+                try: args=json.loads(fn.get('arguments') or '{}')
+                except ValueError: args={}
+                text,ok,status=self._run_tool(str(fn.get('name','')),args if isinstance(args,dict) else {},web,config,net_timeout)
+                for line in status: yield StreamEvent('status',line)
+                if ok and used<_MAX_NOTES_CHARS:
+                    notes.append(text[:_MAX_NOTES_CHARS-used]); used+=len(notes[-1])
+                planner.append({'role':'tool','tool_call_id':str(call.get('id','')),'content':text})
+        if not searched:
+            yield StreamEvent('status','无需联网，直接回答')
+        return '\n\n---\n\n'.join(notes)
 
 def _safe_error_detail(raw):
     try:

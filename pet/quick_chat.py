@@ -181,6 +181,7 @@ class QuickChatBubble(QFrame):
         self.open_chat_btn.clicked.connect(self._open_full_chat)
         self.service.started.connect(self._started)
         self.service.delta.connect(self._delta)
+        self.service.activity.connect(self._activity)
         self.service.finished.connect(self._finished)
         self.service.error.connect(self._error)
         self.service.stopped.connect(self._stopped)
@@ -409,6 +410,12 @@ class QuickChatBubble(QFrame):
         target = getattr(self, "_request_pet_window", self.pet_window)
         valid = getattr(target, "presentation_valid", None)
         return target is self.pet_window and (not callable(valid) or bool(valid()))
+
+    def _activity(self, request_id: str, kind: str, text: str) -> None:
+        if (request_id != self._active_request_id or self._reply_full
+                or not self._request_presentation_valid()):
+            return
+        self.hint_label.setText("深度思考中…" if kind == "reasoning" else str(text).strip()[:30])
 
     def _delta(self, request_id: str, text: str) -> None:
         if request_id != self._active_request_id or not self._request_presentation_valid():

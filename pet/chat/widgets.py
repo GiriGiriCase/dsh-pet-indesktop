@@ -410,6 +410,40 @@ class MessageBubble(QFrame):
         self.surface_layout = surface_layout
         surface_layout.setContentsMargins(0, 0, 0, 0)
         surface_layout.setSpacing(0)
+        # 思考过程 / 联网检索过程：默认隐藏，收到对应事件才出现；可点击折叠。
+        self._reasoning_text = ""
+        self._activity_lines: list[str] = []
+        self._thinking_done = False
+        self.thinking_toggle = QToolButton(self.surface)
+        self.thinking_toggle.setObjectName("thinking-toggle")
+        self.thinking_toggle.setCheckable(True)
+        self.thinking_toggle.setChecked(True)
+        self.thinking_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.thinking_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.thinking_toggle.setStyleSheet(
+            "QToolButton#thinking-toggle { border: none; background: transparent; padding: 2px 0;"
+            " color: rgba(128,128,128,0.95); font-size: 12px; text-align: left; }"
+            "QToolButton#thinking-toggle:hover { color: rgba(90,140,220,1); }"
+        )
+        self.thinking_toggle.toggled.connect(self._on_thinking_toggled)
+        self.thinking_toggle.hide()
+        surface_layout.addWidget(self.thinking_toggle)
+        self.thinking_body = QLabel(self.surface)
+        self.thinking_body.setObjectName("thinking-body")
+        self.thinking_body.setWordWrap(True)
+        self.thinking_body.setTextFormat(Qt.TextFormat.PlainText)
+        self.thinking_body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.thinking_body.setStyleSheet(
+            "QLabel#thinking-body { color: rgba(128,128,128,0.95); font-size: 12px;"
+            " border-left: 2px solid rgba(128,128,128,0.35); padding: 2px 0 2px 10px; margin: 2px 0 8px 0; }"
+        )
+        self.thinking_body.hide()
+        surface_layout.addWidget(self.thinking_body)
+        # 思维链增量很密：合并到 ~80ms 刷一次，避免长文本每个 token 都重排
+        self._thinking_refresh = QTimer(self)
+        self._thinking_refresh.setSingleShot(True)
+        self._thinking_refresh.setInterval(80)
+        self._thinking_refresh.timeout.connect(self._refresh_thinking)
         self.body = QLabel(self.surface)
         self.body.setObjectName("bubble-body")
         self.body.setWordWrap(True)
@@ -457,6 +491,80 @@ class MessageBubble(QFrame):
 
     def set_content(self, text: str) -> None:
         self.body.setText(str(text))
+
+    # ---- 思考 / 联网过程 ----
+    @property
+    def has_thinking(self) -> bool:
+        return bool(self._reasoning_text or self._activity_lines)
+
+    @property
+    def thinking_record(self) -> tuple[str, list[str]]:
+        """(思考过程, 联网进度行)，随回复一起落盘，重新打开会话时回显。"""
+        return self._reasoning_text, list(self._activity_lines)
+
+    def append_reasoning(self, text: str) -> None:
+        self._reasoning_text += str(text)
+        self._show_thinking_panel()
+
+    def add_activity(self, text: str) -> None:
+        self._activity_lines.append(str(text))
+        self._show_thinking_panel()
+
+    def restore_thinking(self, reasoning: str, activity: list[str] | None = None) -> None:
+        """从会话记录恢复思考 / 联网面板（收起状态）。"""
+        self._reasoning_text = str(reasoning or "")
+        self._activity_lines = [str(x) for x in (activity or [])]
+        if not self.has_thinking:
+            return
+        self._thinking_done = True
+        self.thinking_toggle.setChecked(False)
+        self.thinking_toggle.show()
+        self._refresh_thinking()
+
+    def finish_thinking(self) -> None:
+        """正文开始输出或本轮结束：面板收起为一行摘要，点击可展开。"""
+        if self._thinking_done or not self.has_thinking:
+            return
+        self._thinking_done = True
+        self.thinking_toggle.setChecked(False)
+        self._refresh_thinking()
+
+    def _show_thinking_panel(self) -> None:
+        if self.thinking_toggle.isHidden():
+            self.thinking_toggle.show()
+            self.thinking_body.setVisible(self.thinking_toggle.isChecked())
+        if not self._thinking_refresh.isActive():
+            self._thinking_refresh.start()
+
+    def _thinking_summary(self) -> str:
+        searched = any(line.startswith(("🔍", "📄")) for line in self._activity_lines)
+        if not self._thinking_done:
+            label = "💭 深度思考中…" if self._reasoning_text else "🌐 联网检索中…"
+        elif self._reasoning_text and searched:
+            label = "💭 已联网搜索并深度思考"
+        elif self._reasoning_text:
+            label = "💭 已深度思考"
+        elif searched:
+            label = "🔍 已联网搜索"
+        else:
+            label = "🌐 联网检索过程"
+        arrow = "▾" if self.thinking_toggle.isChecked() else "▸"
+        return f"{arrow} {label}（{len(self._reasoning_text)} 字）" if self._reasoning_text else f"{arrow} {label}"
+
+    def _refresh_thinking(self) -> None:
+        parts = []
+        if self._activity_lines:
+            parts.append("\n".join(self._activity_lines))
+        if self._reasoning_text:
+            parts.append(self._reasoning_text.strip())
+        self.thinking_body.setText("\n\n".join(parts))
+        self.thinking_toggle.setText(self._thinking_summary())
+
+    def _on_thinking_toggled(self, checked: bool) -> None:
+        if not self.has_thinking:
+            return
+        self.thinking_body.setVisible(checked)
+        self._refresh_thinking()
 
     def set_state(self, state: str) -> None:
         # 打字机每 tick 都会调本方法：状态未变时全部视觉副作用都是冗余
@@ -1245,6 +1353,7 @@ class ChatWindow(QDialog):
         self.composer.send_requested.connect(self.send_message)
         self.service.started.connect(self._started)
         self.service.delta.connect(self._delta)
+        self.service.activity.connect(self._activity)
         self.service.finished.connect(self._finished)
         self.service.error.connect(self._error)
         self.service.stopped.connect(self._stopped)
@@ -1426,7 +1535,9 @@ class ChatWindow(QDialog):
     def _load(self) -> None:
         self._clear_message_rows()
         for message in self.session.messages:
-            self._add(message.role, message.content)
+            bubble = self._add(message.role, message.content)
+            if message.reasoning or message.activity:
+                bubble.restore_thinking(message.reasoning, message.activity)
         self._set_empty_state(not bool(self.session.messages))
         self._bottom()
 
@@ -1920,11 +2031,27 @@ class ChatWindow(QDialog):
             self._bubble.set_state("streaming")
         self.pet_link.thinking()
 
+    def _activity(self, request_id: str, kind: str, text: str) -> None:
+        """思考过程 / 联网进度：进气泡顶部的折叠面板，不进正文（随回复另存，见 _complete_finished）。"""
+        if request_id != self._active_request_id or not self._bubble:
+            return
+        if kind == "reasoning":
+            self._bubble.append_reasoning(text)
+            self.status.setText("深度思考中…")
+        else:
+            self._bubble.add_activity(text)
+            self.status.setText(str(text).strip()[:40])
+        self._update_conversation_height()
+        if self._stream_follow_output:
+            self._bottom()
+
     def _delta(self, request_id: str, text: str) -> None:
         if request_id != self._active_request_id:
             return
         if not text:
             return
+        if self._bubble:
+            self._bubble.finish_thinking()
         self._pending_output += str(text)
         if not self._typewriter_timer.isActive():
             self._typewriter_timer.start()
@@ -1982,12 +2109,16 @@ class ChatWindow(QDialog):
         self._complete_finished(text)
 
     def _complete_finished(self, text: str) -> None:
+        reasoning, activity = "", []
         if self._bubble:
+            self._bubble.finish_thinking()
             self._bubble.set_content(text)
             self._bubble.set_state("normal")
-        synced, _absorbed = self.store.append_message(self.session, ChatMessage("assistant", text))
+            reasoning, activity = self._bubble.thinking_record
+        reply = ChatMessage("assistant", text, reasoning=reasoning, activity=activity)
+        synced, _absorbed = self.store.append_message(self.session, reply)
         if synced is None:
-            self.session.messages.append(ChatMessage("assistant", text))
+            self.session.messages.append(reply)
             self.store.save(self.session)
         else:
             self.session = synced
@@ -2005,6 +2136,7 @@ class ChatWindow(QDialog):
         self._pending_output = ""
         self._pending_finish_text = None
         if self._bubble:
+            self._bubble.finish_thinking()
             self._bubble.set_content("请求失败：" + str(text))
             self._bubble.set_state("error")
         self._reset()
@@ -2026,7 +2158,8 @@ class ChatWindow(QDialog):
         self._pending_output = ""
         self._pending_finish_text = None
         if self._bubble:
-            if self._text:
+            if self._text or self._bubble.has_thinking:
+                self._bubble.finish_thinking()
                 self._bubble.set_content(self._text)
                 self._bubble.set_state("stopped")
             else:

@@ -563,6 +563,7 @@ class ChatWindow(QDialog):
         self.composer.send_requested.connect(self.send_message)
         self.service.started.connect(self._started)
         self.service.delta.connect(self._delta)
+        self.service.activity.connect(self._activity)
         self.service.finished.connect(self._finished)
         self.service.error.connect(self._error)
         self.service.stopped.connect(self._stopped)
@@ -980,6 +981,12 @@ class ChatWindow(QDialog):
         if self._bubble:
             self._bubble.set_state("streaming")
         self.pet_link.thinking()
+
+    def _activity(self, request_id: str, kind: str, text: str) -> None:
+        # 经典窗口只在状态栏提示思考/联网进度，思维链不进正文
+        if request_id != self._active_request_id or self._text:
+            return
+        self.status.setText("深度思考中…" if kind == "reasoning" else str(text).strip()[:30])
 
     def _delta(self, request_id: str, text: str) -> None:
         if request_id != self._active_request_id:

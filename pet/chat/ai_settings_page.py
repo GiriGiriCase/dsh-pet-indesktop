@@ -43,8 +43,9 @@ class _AiSettingsPage(QWidget):
         self.setObjectName("aiSettingsContent")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         # No-chat bundles exclude pet.chat and never construct this optional page.
-        from .models import ProviderConfig, SecretStore
+        from .models import ProviderConfig, SecretStore, WEB_SEARCH_KEYED_ENGINES
         from .providers import test_connection
+        from .web_search import ENGINE_LABELS
 
         self.config = config
         self._provider_config_type = ProviderConfig
@@ -80,10 +81,38 @@ class _AiSettingsPage(QWidget):
         self.temperature.setSingleStep(0.1)
         self.temperature.setValue(provider.temperature)
         self.tokens = BrowserSpinBox()
-        self.tokens.setRange(1, 32768)
+        self.tokens.setRange(1, 131072)
         self.tokens.setValue(provider.max_tokens)
         self.skip_ssl = ToggleSwitch()
         self.skip_ssl.setChecked(not provider.verify_ssl)
+        # 深度思考（按 provider 保存）
+        self.thinking_mode = ModernSelect(self, width=230)
+        self.thinking_mode.addItem("跟随模型默认", "auto")
+        self.thinking_mode.addItem("开启深度思考", "enabled")
+        self.thinking_mode.addItem("关闭深度思考", "disabled")
+        self.thinking_mode.setCurrentData(provider.thinking)
+        self.reasoning_effort = ModernSelect(self, width=230)
+        self.reasoning_effort.addItem("低（更快）", "low")
+        self.reasoning_effort.addItem("高（默认）", "high")
+        self.reasoning_effort.addItem("最大（最慢、最深入）", "max")
+        self.reasoning_effort.setCurrentData(provider.reasoning_effort)
+        # 联网搜索（全局，所有 provider 共用）
+        self._web_keyed_engines = WEB_SEARCH_KEYED_ENGINES
+        web = self.settings.web_search
+        self.web_search_enabled = ToggleSwitch()
+        self.web_search_enabled.setChecked(bool(web.enabled))
+        self.web_search_engine = ModernSelect(self, width=230)
+        for engine_id, engine_label in ENGINE_LABELS.items():
+            self.web_search_engine.addItem(engine_label, engine_id)
+        self.web_search_engine.setCurrentData(web.engine)
+        self.web_search_key = _line_edit(password=True)
+        self.web_search_key.setPlaceholderText("已保存则留空；输入新值将覆盖")
+        self.web_search_results = BrowserSpinBox()
+        self.web_search_results.setRange(1, 10)
+        self.web_search_results.setSuffix(" 条")
+        self.web_search_results.setValue(int(web.max_results))
+        self.web_search_fetch = ToggleSwitch()
+        self.web_search_fetch.setChecked(bool(web.fetch_pages))
         self.system_notify_check = ToggleSwitch()
         # 系统通知键：构造期快照无条件回写会把打开期间外部（老聊天设置即存入口
         # settings_dialog.py:437）对该键的改动静默回滚，所以只在用户实际拨动过
@@ -185,6 +214,36 @@ class _AiSettingsPage(QWidget):
             SettingRow("system_prompt", "System Prompt", "定义桌宠对话时的身份、语气和行为。", self.prompt, stacked=True),
             SettingRow("connection_test", "连接测试", self.test_result.text(), self.test_button),
         ], self))
+        thinking_web_rows = [
+            SettingRow(
+                "thinking_mode", "深度思考",
+                "DeepSeek V4 等思考模型会先推理再回答，思考过程显示在回复上方（可折叠）。"
+                "「跟随模型默认」不额外发送参数；开启后建议把「最大输出 Token」调到 8192 以上。",
+                self.thinking_mode,
+            ),
+            SettingRow("reasoning_effort", "思考强度", "仅在「开启深度思考」时发送；强度越高越慢、越耗 Token。", self.reasoning_effort),
+            SettingRow(
+                "web_search_enabled", "联网搜索",
+                "回答前先由模型判断是否需要查资料，需要时自动搜索并阅读网页，再结合结果回答；闲聊不会触发搜索。",
+                self.web_search_enabled,
+            ),
+            SettingRow(
+                "web_search_engine", "搜索引擎",
+                "百度适合国内直连，DuckDuckGo 通常需要代理，两者互为备用；免 Key 引擎搜索过于频繁会被要求人机验证。需要稳定联网请选博查或 Tavily（付费 API）。",
+                self.web_search_engine,
+            ),
+            SettingRow("web_search_key", "搜索 API Key", "博查 / Tavily 的 API Key，优先保存到系统钥匙串。", self.web_search_key),
+            SettingRow("web_search_max_results", "每次搜索结果数", "单次搜索交给模型的结果条数。", self.web_search_results),
+            SettingRow("web_search_fetch_pages", "允许阅读网页正文", "搜索摘要不够时，允许模型打开网页读取正文（更准，但更慢）。", self.web_search_fetch),
+        ]
+        root.addWidget(SettingsSection("深度思考与联网", thinking_web_rows, self))
+        self._reasoning_effort_row = thinking_web_rows[1]
+        self._web_detail_rows = thinking_web_rows[3:]
+        self._web_key_row = thinking_web_rows[4]
+        self.thinking_mode.currentIndexChanged.connect(self._update_thinking_web_visibility)
+        self.web_search_enabled.toggled.connect(self._update_thinking_web_visibility)
+        self.web_search_engine.currentIndexChanged.connect(self._update_thinking_web_visibility)
+        self._update_thinking_web_visibility()
         root.addWidget(SettingsSection("系统通知", [
             SettingRow(
                 "system_notifications_enabled", "系统通知",
@@ -210,7 +269,7 @@ class _AiSettingsPage(QWidget):
         root.addWidget(SettingsSection("生成参数（高级）", [
             SettingRow("timeout", "请求超时", "等待模型服务响应的最长时间。", self.timeout),
             SettingRow("temperature", "Temperature", "数值越高，回答越随机。", self.temperature),
-            SettingRow("max_tokens", "最大输出 Token", "限制模型单次回复的最大长度。", self.tokens),
+            SettingRow("max_tokens", "最大输出 Token", "限制模型单次回复的最大长度；开启深度思考时思考过程也计入，建议 8192 以上。", self.tokens),
             SettingRow("skip_ssl", "跳过 SSL 证书验证", "仅用于本地网关或自签名证书。", self.skip_ssl),
         ], self, advanced=True))
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
@@ -300,6 +359,16 @@ class _AiSettingsPage(QWidget):
         self._capture_background_value()
         self._background_style = str(self.chat_ui_style.currentData() or "modern")
         self._populate_background_options(self._background_style)
+
+    def _update_thinking_web_visibility(self, *_args) -> None:
+        self._reasoning_effort_row.setVisible(self.thinking_mode.currentData() == "enabled")
+        web_on = self.web_search_enabled.isChecked()
+        for row in self._web_detail_rows:
+            row.setVisible(web_on)
+        self._web_key_row.setVisible(web_on and self.web_search_engine.currentData() in self._web_keyed_engines)
+        card = self._reasoning_effort_row.parentWidget()
+        if isinstance(card, SettingsCard):
+            card.refresh_separators()
 
     def _update_vision_visibility(self, reuse_chat_model: bool) -> None:
         for row in self._vision_override_rows:
@@ -399,6 +468,8 @@ class _AiSettingsPage(QWidget):
             "vision_base_url": self.vision_url.text().strip(),
             "vision_key": vkey_text if vkey_text else existing.get("vision_key", ""),
             "verify_ssl": not self.skip_ssl.isChecked(),
+            "thinking": str(self.thinking_mode.currentData() or "auto"),
+            "reasoning_effort": str(self.reasoning_effort.currentData() or "high"),
         }
 
     def _load_provider_ui(self, provider_id: str) -> None:
@@ -419,6 +490,9 @@ class _AiSettingsPage(QWidget):
         self.vision_url.setText(draft.get("vision_base_url", p.vision_base_url))
         self.vision_key.clear()
         self.skip_ssl.setChecked(not bool(draft.get("verify_ssl", p.verify_ssl)))
+        self.thinking_mode.setCurrentData(draft.get("thinking", p.thinking))
+        self.reasoning_effort.setCurrentData(draft.get("reasoning_effort", p.reasoning_effort))
+        self._update_thinking_web_visibility()
         self._update_provider_buttons()
 
     def _on_provider_changed(self, _index: int = -1) -> None:
@@ -456,6 +530,8 @@ class _AiSettingsPage(QWidget):
             vision_base_url=base.vision_base_url,
             vision_api_key_ref=f"provider/{new_id}/vision",
             verify_ssl=base.verify_ssl,
+            thinking=base.thinking,
+            reasoning_effort=base.reasoning_effort,
         )
         self.settings.providers[new_id] = new
         self._provider_drafts[new_id] = {
@@ -471,6 +547,8 @@ class _AiSettingsPage(QWidget):
             "vision_base_url": new.vision_base_url,
             "vision_key": "",
             "verify_ssl": new.verify_ssl,
+            "thinking": new.thinking,
+            "reasoning_effort": new.reasoning_effort,
         }
         self._loading_provider = True
         try:
@@ -522,6 +600,8 @@ class _AiSettingsPage(QWidget):
         p.vision_same_as_chat = bool(draft.get("vision_same_as_chat", p.vision_same_as_chat))
         p.vision_base_url = draft.get("vision_base_url", p.vision_base_url)
         p.verify_ssl = bool(draft.get("verify_ssl", p.verify_ssl))
+        p.thinking = str(draft.get("thinking", p.thinking) or "auto")
+        p.reasoning_effort = str(draft.get("reasoning_effort", p.reasoning_effort) or "high")
         key = str(draft.get("key") or "")
         if key:
             p.api_key_ref = p.api_key_ref or f"provider/{provider_id}"
@@ -534,6 +614,23 @@ class _AiSettingsPage(QWidget):
             if not self._secret_store_type().set(p.vision_api_key_ref, vkey):
                 p.vision_api_key = vkey
                 QMessageBox.warning(self, "安全存储不可用", "无法使用系统安全存储，Key 仅本次运行保留，重启需重输。")
+
+    def _apply_web_search_settings(self) -> None:
+        web = self.settings.web_search
+        web.enabled = self.web_search_enabled.isChecked()
+        web.engine = str(self.web_search_engine.currentData() or "baidu")
+        web.max_results = int(self.web_search_results.value())
+        web.fetch_pages = self.web_search_fetch.isChecked()
+        key = self.web_search_key.text().strip()
+        if key:
+            web.api_key_ref = web.api_key_ref or "websearch/api"
+            if self._secret_store_type().set(web.api_key_ref, key):
+                web.api_key = ""
+            else:
+                web.api_key = key
+                QMessageBox.warning(self, "安全存储不可用", "无法使用系统安全存储，搜索 API Key 仅本次运行保留，重启需重输。")
+            self.web_search_key.clear()
+        self.settings.attach_runtime()
 
     def provisional_config(self):
         provider = self.settings.active_config
@@ -550,6 +647,8 @@ class _AiSettingsPage(QWidget):
             float(self.temperature.value()),
             int(self.tokens.value()),
             verify_ssl=not self.skip_ssl.isChecked(),
+            thinking=str(self.thinking_mode.currentData() or "auto"),
+            reasoning_effort=str(self.reasoning_effort.currentData() or "high"),
         )
 
     def _run_test(self) -> None:
@@ -600,6 +699,7 @@ class _AiSettingsPage(QWidget):
         for pid in list(self.settings.providers):
             self._apply_draft_to_provider(pid)
         self.settings.default_system_prompt = self.prompt.toPlainText().strip()
+        self._apply_web_search_settings()
         self.config.set("chat_ui_style", self.chat_ui_style.currentData())
         self._capture_background_value()
         # 按风格脏标记合并：只回写本窗口编辑过的风格，未触风格保持磁盘最新值

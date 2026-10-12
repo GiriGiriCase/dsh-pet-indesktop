@@ -4,9 +4,11 @@ from typing import Any
 from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtWidgets import QApplication
 from .models import ProviderConfig
-from .providers import OpenAICompatibleProvider
+from .providers import OpenAICompatibleProvider, StreamEvent
 class _Worker(QThread):
     delta_received=Signal(str); completed=Signal(str); failed=Signal(str); stopped_by_user=Signal()
+    # 非正文事件：(kind, text)，kind 为 'reasoning'（思考过程）或 'status'（联网进度）
+    activity_received=Signal(str,str)
     def __init__(self,provider,messages,config,cancel):
         super().__init__()
         self.provider=provider; self.messages=messages; self.config=config; self.cancel=cancel; self.parts=[]
@@ -25,6 +27,9 @@ class _Worker(QThread):
                 stream_kwargs['response_holder'] = self._responses
             for text in self.provider.stream(self.messages,self.config,self.cancel,**stream_kwargs):
                 if self.cancel.is_set(): self.stopped_by_user.emit(); return
+                if isinstance(text,StreamEvent):
+                    if text.text: self.activity_received.emit(text.kind,text.text)
+                    continue
                 self.parts.append(text); self.delta_received.emit(text)
             if self.cancel.is_set(): self.stopped_by_user.emit()
             else:
@@ -37,6 +42,8 @@ class _Worker(QThread):
             self.stopped_by_user.emit() if self.cancel.is_set() else self.failed.emit(str(exc))
 class ChatService(QObject):
     started=Signal(str); delta=Signal(str,str); finished=Signal(str,str); error=Signal(str,str); stopped=Signal(str)
+    # (request_id, kind, text)：kind='reasoning' 思考过程增量 / 'status' 联网检索进度
+    activity=Signal(str,str,str)
     # 进程级「回复完成」订阅（灵动岛事件动效等）：AppShell 注册一次，
     # 回调总在 GUI 线程执行（worker→本对象的链路全是 QueuedConnection）。
     _global_finished_listeners: list = []
@@ -82,6 +89,7 @@ class ChatService(QObject):
         # 会在 worker 线程执行 _delta/_cleanup 等，与 GUI 线程的 busy()/
         # _request_id 读写构成数据竞态。队列投递保证回调只在 GUI 线程跑。
         worker.delta_received.connect(lambda text,rid=rid:self._delta(rid,text), Qt.QueuedConnection)
+        worker.activity_received.connect(lambda kind,text,rid=rid:self._activity(rid,kind,text), Qt.QueuedConnection)
         worker.completed.connect(lambda text,rid=rid:self._finished(rid,text), Qt.QueuedConnection)
         worker.failed.connect(lambda text,rid=rid:self._error(rid,text), Qt.QueuedConnection)
         worker.stopped_by_user.connect(lambda rid=rid:self._stopped(rid), Qt.QueuedConnection)
@@ -100,6 +108,8 @@ class ChatService(QObject):
     def _current(self,rid): return rid==self._request_id
     def _delta(self,rid,text):
         if self._current(rid): self.delta.emit(rid,text)
+    def _activity(self,rid,kind,text):
+        if self._current(rid): self.activity.emit(rid,kind,text)
     def _finished(self,rid,text):
         if self._current(rid):
             self.finished.emit(rid,text)

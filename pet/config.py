@@ -2207,6 +2207,9 @@ class Config:
                     if isinstance(provider, dict):
                         provider.pop("api_key", None)
                         provider.pop("vision_api_key", None)
+            web_search = chat.get("web_search")
+            if isinstance(web_search, dict):
+                web_search.pop("api_key", None)
         return write_data
 
     def _read_reset_generations(self) -> dict:
