@@ -431,6 +431,14 @@ def _default_chat_data():
                 "max_tokens": 2048,
             }
         },
+        # 联网搜索（全局，所有服务商共用；字段语义见 pet/chat/models.WebSearchSettings）
+        "web_search": {
+            "enabled": False,
+            "engine": "baidu",
+            "api_key_ref": "websearch/api",
+            "max_results": 5,
+            "fetch_pages": True,
+        },
     }
 
 

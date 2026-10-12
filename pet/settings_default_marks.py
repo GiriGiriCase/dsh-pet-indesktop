@@ -79,6 +79,11 @@ _ROW_DEFAULT_PATHS: dict[str, str | tuple[str, float]] = {
     "dynamic_island_event_effects": "dynamic_island.event_effects",
     "dynamic_island_edge_dock": "dynamic_island.edge_dock",
     "dynamic_island_collision": "dynamic_island.collision_enabled",
+    # 联网搜索（chat.web_search，全局）
+    "web_search_enabled": "chat.web_search.enabled",
+    "web_search_engine": "chat.web_search.engine",
+    "web_search_max_results": "chat.web_search.max_results",
+    "web_search_fetch_pages": "chat.web_search.fetch_pages",
     # 菜单外观 / 彩蛋（嵌套 dict）
     "menu_theme": "context_menu_appearance.theme",
     "menu_density": "context_menu_appearance.density",

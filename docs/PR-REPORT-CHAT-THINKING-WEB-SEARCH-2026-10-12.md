@@ -138,3 +138,21 @@
 - 冲突：`pet/quick_chat.py`：上游新增 `_request_presentation_valid()`（请求发出时的宠物窗口已失效则不再更新气泡），与本 PR 的 `_activity` 相邻。两者都保留，并让 `_activity` 同样遵守该检查，与上游 `_delta` 口径一致。`docs/INDEX.md` 登记行按并集合并。
 - 重叠检查：`git grep` 新基线，上游没有同类实现（`reasoning_content` 只在 `pet/vision.py` 的看屏响应里读取；无 `setMarkdown`；无对话时间注入）。
 - 第一节到第八节的数字基于 `ee699c7` 测得，未在新基线上重测（实现未变，只是位置变了）；新基线上的测试结果见 PR 描述「第二轮」。
+
+## 十、第三轮：接入上游新增的设置页规范（2026-10-13）
+
+新基线带来两条设置页守卫，本 PR 的 7 行在第二轮全量测试中触发 3 个失败，逐条处理：
+
+| 失败用例 | 原因 | 处理 |
+|---|---|---|
+| `test_settings_default_marks.py::test_supported_rows_without_default_are_a_frozen_set`（及 macOS 对齐用例） | 新行既未登记默认值路径，也未列入「无可比默认值」快照 | `pet/config.py` 的 chat 出厂数据补 `web_search`（默认值唯一来源，与 `WebSearchSettings` 一致）；`pet/settings_default_marks.py` 登记 4 行路径（`chat.web_search.enabled/engine/max_results/fetch_pages`）；`thinking_mode` / `reasoning_effort`（逐服务商字段）与 `web_search_key`（密钥）列入快照 |
+| `test_settings_page_guide.py::test_every_group_has_a_description` | 新分组「深度思考与联网」没有描述 | `pet/settings_page_guide.py::SECTION_GUIDE` 补一句 |
+
+| 文件 | 增删 |
+|---|---|
+| `pet/config.py` | +8 / −0 |
+| `pet/settings_default_marks.py` | +5 / −0 |
+| `pet/settings_page_guide.py` | +1 / −0 |
+| `tests/test_settings_default_marks.py` | +4 / −0 |
+
+验证：`pytest -q tests/test_settings_default_marks.py tests/test_settings_page_guide.py tests/test_chat_thinking_web_search.py tests/test_chat_subsystem.py tests/test_architecture.py tests/test_config*.py` → 352 passed, 1 skipped（Python 3.11.5，Windows）。
