@@ -53,7 +53,8 @@ def test_switch_character_moves_session_and_prompt_to_new_character(tmp_path):
         # prompt 链路跟着新角色走
         messages = bubble.prompt_builder.build_messages(
             bubble.settings, bubble.character_id, [], "在吗")
-        assert messages[0]["content"] == bubble.session.system_prompt
+        # system 末尾附有时间感知信息（PromptBuilder），角色设定部分必须是新角色的
+        assert messages[0]["content"].startswith(bubble.session.system_prompt + "\n\n【时间信息】")
     finally:
         bubble.close()
         app.processEvents()
