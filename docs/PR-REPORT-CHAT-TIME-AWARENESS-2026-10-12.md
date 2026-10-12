@@ -91,3 +91,11 @@
 ## 八、风险与回滚
 
 影响面：所有经 `PromptBuilder.build_messages` 的对话请求内容。无新增配置键、会话文件格式不变。回滚 = `git revert`，无残留状态。
+
+## 九、第二轮：rebase 到 `dca44a7`（2026-10-13）
+
+上游合并 #243（release/2026-10-08-candidate，基线 `ee699c7` 之后 168 个提交）后，本分支 rebase 到 `dca44a7`。
+
+- 冲突：无代码冲突；`docs/INDEX.md` 登记行按并集合并。
+- 重叠检查：`git grep` 新基线，上游没有同类实现（`reasoning_content` 只在 `pet/vision.py` 的看屏响应里读取；无 `setMarkdown`；无对话时间注入）。
+- 第一节到第八节的数字基于 `ee699c7` 测得，未在新基线上重测（实现未变，只是位置变了）；新基线上的测试结果见 PR 描述「第二轮」。
