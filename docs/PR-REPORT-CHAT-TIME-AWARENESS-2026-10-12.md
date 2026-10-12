@@ -99,3 +99,11 @@
 - 冲突：无代码冲突；`docs/INDEX.md` 登记行按并集合并。
 - 重叠检查：`git grep` 新基线，上游没有同类实现（`reasoning_content` 只在 `pet/vision.py` 的看屏响应里读取；无 `setMarkdown`；无对话时间注入）。
 - 第一节到第八节的数字基于 `ee699c7` 测得，未在新基线上重测（实现未变，只是位置变了）；新基线上的测试结果见 PR 描述「第二轮」。
+
+## 十、第三轮：适配上游新增用例（2026-10-13）
+
+新基线的 `tests/test_quick_chat.py::test_switch_character_moves_session_and_prompt_to_new_character`（B07）断言
+`build_messages` 的 system 与角色设定**完全相等**；本 PR 在 system 末尾追加时间信息，改为断言「以新角色设定 + `
+
+【时间信息】` 开头」，
+用例意图（prompt 链路跟着新角色走）不变。`tests/test_quick_chat.py` +2 / −1；`pytest -q tests/test_quick_chat.py tests/test_chat_time_awareness.py` → 14 passed。
